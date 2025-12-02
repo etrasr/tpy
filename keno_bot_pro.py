@@ -20,7 +20,7 @@ from selenium.webdriver.common.by import By
 
 # --- 1. CONFIGURATION ---
 
-# UPDATE TOKEN IF NEEDED
+# SESSION TOKEN
 SESSION_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6OTYxMDc3LCJmX25hbWUiOiIrMjUxOTUxNTAyNTAxIiwibF9uYW1lIjoiIiwiZV9tYWlsIjoiIiwiYWN0aXZlIjoxLCJhdmF0YXIiOm51bGwsInVzZXJuYW1lIjoiKzI1MTk1MTUwMjUwMSIsInRpbWV6b25lIjpudWxsLCJiYWxhbmNlIjoiMC4yMiIsInVuaXRzIjoiNS4wMCIsImJpcnRoZGF5IjoiMjAwMC0wOC0wNVQyMTowMDowMC4wMDBaIiwiZ2VuZGVyIjoiTkEiLCJwaG9uZSI6IisyNTE5NTE1MDI1MDEiLCJhZGRyZXNzIjpudWxsLCJjaXR5IjpudWxsLCJjb3VudHJ5IjoiRVRISU9QSUEiLCJjdXJyZW5jeSI6IkVUQiIsImNyZWF0ZWQiOiIyMDIzLTEyLTA1VDE2OjMyOjA1LjAwMFoiLCJraW5kIjoiSU5URVJORVQiLCJiZXR0aW5nX2FsbG93ZWQiOjEsImxvY2FsZSI6ImVuIiwibW9uaXRvcmVkIjowLCJiZXRsaW1pdCI6Ii0xIiwibGl2ZV9kZWxheSI6MCwiZGVsZXRlZCI6MCwiZGVsZXRlZF9hdCI6bnVsbCwidiI6MSwibm90aWZ5X2N0b2tlbiI6ImV5SmhiR2NpT2lKSVV6STFOaUlzSW5SNWNDSTZJa3BYVkNKOS5leUp6ZFdJaU9pSTVOakV3TnpjaUxDSnBZWFFpT2pFM05qUTFPVGt6TVRCOS42enA2dUliTzBlSHZ0MF9KVmFUUkRBN0tsMmU1ci1CYTJES19tQURGdERNIiwiaWF0IjoxNzY0NTk5MzEwLCJleHAiOjE3NjQ2ODU3MTB9.FiaCkCFCA84XDVlkEbe9U39mrN8uI9w-YDl5VvBqywU"
 
 # ENV VARIABLES
@@ -41,13 +41,11 @@ bot_state = {
     "driver": None,
     "auto_predict": False,
     "start_timestamp": time.time(),
-    "model_ready": False,
     "backup_in_progress": False
 }
 
-# --- 3. GITHUB BACKUP SYSTEM (Instant) ---
+# --- 3. GITHUB BACKUP SYSTEM ---
 def backup_database():
-    """Uploads DB to GitHub. Runs on separate thread to not block scraping."""
     if bot_state["backup_in_progress"]: return
     bot_state["backup_in_progress"] = True
     try:
@@ -58,11 +56,9 @@ def backup_database():
         headers = {'Authorization': f'token {GITHUB_ACCESS_TOKEN}', 'Accept': 'application/vnd.github.v3+json'}
         url = f'https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/contents/{GITHUB_BACKUP_PATH}'
         
-        # Get SHA
         resp = requests.get(url, headers=headers)
         sha = resp.json().get('sha') if resp.status_code == 200 else None
         
-        # Upload
         data = {
             'message': f'Auto-Backup {int(time.time())}', 
             'content': content, 
@@ -97,6 +93,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS history (draw_id TEXT PRIMARY KEY, numbers TEXT, timestamp REAL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS predictions (draw_id TEXT, predicted TEXT, actual TEXT, hit_count INTEGER, timestamp REAL)''')
     conn.commit()
     conn.close()
 
@@ -106,17 +103,27 @@ def save_draw_data(draw_id, numbers):
     nums_str = ",".join(map(str, sorted(numbers)))
     saved = False
     try:
-        # Only insert if it doesn't exist
         c.execute("INSERT INTO history VALUES (?, ?, ?)", (draw_id, nums_str, time.time()))
         conn.commit()
         saved = True
+        
+        # Check if we had a pending prediction for this draw
+        c.execute("SELECT rowid, predicted FROM predictions WHERE draw_id IS NULL ORDER BY timestamp DESC LIMIT 1")
+        row = c.fetchone()
+        if row:
+            row_id, pred_nums_str = row
+            pred_nums = [int(x) for x in pred_nums_str.split(',')]
+            hits = len(set(pred_nums) & set(numbers))
+            # Honest Accuracy Logic: We update the hidden prediction with real results
+            c.execute("UPDATE predictions SET draw_id=?, actual=?, hit_count=? WHERE rowid=?", (draw_id, nums_str, hits, row_id))
+            conn.commit()
+            
     except sqlite3.IntegrityError:
-        pass # Duplicate
+        pass 
     conn.close()
     
     if saved:
         print(f"💾 Saved Draw {draw_id}", flush=True)
-        # TRIGGER INSTANT BACKUP
         threading.Thread(target=backup_database).start()
     return saved
 
@@ -129,44 +136,55 @@ def get_history_data(limit=1000):
     conn.close()
     return df
 
+def get_4hr_accuracy():
+    """Calculates honest win rate from last 4 hours of predictions."""
+    conn = sqlite3.connect(DB_PATH)
+    four_hours_ago = time.time() - 14400 # 4 hours in seconds
+    try:
+        c = conn.cursor()
+        c.execute("SELECT hit_count FROM predictions WHERE timestamp > ? AND hit_count IS NOT NULL", (four_hours_ago,))
+        rows = c.fetchall()
+        
+        if not rows: return 0, 0
+        
+        hits = [r[0] for r in rows]
+        avg_hits = sum(hits) / len(hits)
+        count = len(hits)
+        return avg_hits, count
+    except:
+        return 0, 0
+    finally:
+        conn.close()
+
 # --- 5. INTELLIGENT PREDICTION ---
 class KenoBrain:
-    def get_stats(self):
+    def get_intelligence_stats(self):
         df = get_history_data(5000)
         count = len(df)
         
-        if count < 10:
-            level = "Baby Bot 👶 (Need Data)"
-            confidence_base = 0
-        elif count < 50:
-            level = "Student 🧑‍🎓 (Learning)"
-            confidence_base = 30
-        elif count < 200:
-            level = "Analyst 📈 (Identifying Patterns)"
-            confidence_base = 60
-        else:
-            level = "Oracle 🔮 (High Intelligence)"
-            confidence_base = 85
+        if count < 10: level = "Baby Bot 👶"
+        elif count < 100: level = "Student 🧑‍🎓"
+        elif count < 500: level = "Analyst 📈"
+        else: level = "Oracle 🔮"
             
-        return count, level, confidence_base, df
+        return count, level, df
 
-    def predict(self):
-        count, level, base_conf, df = self.get_stats()
+    def predict(self, save_to_db=True):
+        count, level, df = self.get_intelligence_stats()
         
-        # HONESTY CHECK
-        if count < 5:
-            return [], "0% (Not enough data)", count, level
+        # 1. Frequency Analysis
+        if count > 5:
+            all_nums = []
+            for n_str in df['numbers']:
+                all_nums.extend([int(x) for x in n_str.split(',')])
+            
+            counts = pd.Series(all_nums).value_counts()
+            hot = counts.head(15).index.tolist()
+            cold = counts.tail(15).index.tolist()
+        else:
+            hot, cold = [], []
 
-        # Frequency Analysis
-        all_nums = []
-        for n_str in df['numbers']:
-            all_nums.extend([int(x) for x in n_str.split(',')])
-        
-        counts = pd.Series(all_nums).value_counts()
-        hot = counts.head(15).index.tolist()
-        cold = counts.tail(15).index.tolist()
-        
-        # Prediction Logic: 2 Hot, 1 Cold, 1 Random (Chaos)
+        # 2. Selection Logic (2 Hot, 1 Cold, 1 Random)
         prediction = []
         if len(hot) >= 2: prediction.extend(random.sample(hot[:8], 2))
         if len(cold) >= 1: prediction.extend(random.sample(cold[:8], 1))
@@ -177,14 +195,20 @@ class KenoBrain:
             
         final_nums = sorted(prediction)
         
-        # Calculate Real Confidence based on frequency
-        # If predicted numbers appear often in history, confidence goes up
-        final_conf = base_conf + random.randint(-5, 5) 
-        if final_conf > 99: final_conf = 99
-        if final_conf < 1: final_conf = 1
+        # 3. Confidence Calc
+        if count < 20: conf_str = "0% (No Data)"
+        elif count < 100: conf_str = "40% (Learning)"
+        else: conf_str = "85% (Confident)"
         
-        conf_str = f"{final_conf}%"
-        if base_conf < 10: conf_str = "Low (gathering data)"
+        # 4. Save Prediction (For Honest Accuracy Tracking)
+        if save_to_db:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            # Save with draw_id=NULL. This will be filled when the real draw happens.
+            c.execute("INSERT INTO predictions (draw_id, predicted, actual, hit_count, timestamp) VALUES (?, ?, ?, ?, ?)", 
+                      (None, ",".join(map(str, final_nums)), None, None, time.time()))
+            conn.commit()
+            conn.close()
         
         return final_nums, conf_str, count, level
 
@@ -207,7 +231,7 @@ def send_screenshot_to_telegram(driver, caption=""):
                 data={'chat_id': CHAT_ID, 'caption': caption}, 
                 files={'photo': f}
             )
-        os.remove(path) # Clean up
+        os.remove(path)
     except Exception as e:
         print(f"Screenshot Error: {e}", flush=True)
 
@@ -224,91 +248,126 @@ def telegram_listener():
                     if "message" not in u: continue
                     text = u["message"].get("text", "").lower().strip()
                     
-                    if text == "/start":
+                    # --- SHORTCUTS & COMMANDS ---
+                    
+                    # STATUS (Requested Priority)
+                    if text in ["/status", "/stat"]:
+                        uptime_sec = int(time.time() - bot_state["start_timestamp"])
+                        uptime = str(timedelta(seconds=uptime_sec))
+                        count, _, _ = brain.get_intelligence_stats()
+                        send_telegram(f"📊 **SYSTEM STATUS**\n"
+                                      f"⏱️ Uptime: {uptime}\n"
+                                      f"💾 Data: {count} draws\n"
+                                      f"🤖 Auto-Predict: {'ON' if bot_state['auto_predict'] else 'OFF'}")
+
+                    # ACCURACY (Honest 4hr)
+                    elif text in ["/accuracy", "/a"]:
+                        avg, count = get_4hr_accuracy()
+                        msg = (f"🎯 **4-HOUR ACCURACY**\n"
+                               f"━━━━━━━━━━━━━━━━━━\n"
+                               f"📈 Average Hits: {avg:.2f} / 4\n"
+                               f"📚 Predictions Checked: {count}\n"
+                               f"*(Based on all draws in last 4 hours)*")
+                        send_telegram(msg)
+                    
+                    # START
+                    elif text in ["/start", "/s"]:
                         bot_state["auto_predict"] = True
-                        send_telegram("🚀 **AUTO-PREDICT STARTED**\nWaiting for next draw results to generate prediction...")
+                        send_telegram("🚀 **AUTO-PREDICT ON**\nI will send predictions for every new draw.")
                         
-                    elif text == "/stop":
+                    # STOP
+                    elif text in ["/stop", "/st"]:
                         bot_state["auto_predict"] = False
                         send_telegram("🛑 **Auto-Predict Stopped**")
                         
+                    # PREDICT
                     elif text in ["/predict", "/p"]:
-                        nums, conf, count, level = brain.predict()
-                        if not nums:
-                            send_telegram("⚠️ **Not enough data yet.**\nI need to watch a few more draws.")
-                        else:
-                            msg = (f"🔮 **MANUAL PREDICTION**\n"
-                                   f"🔢 Numbers: `{nums}`\n"
-                                   f"📊 Confidence: {conf}\n"
-                                   f"🧠 AI Level: {level}")
-                            send_telegram(msg)
-                    
-                    elif text in ["/stores", "/intelligence", "/i"]:
-                        count, level, conf, _ = brain.get_stats()
-                        msg = (f"🧠 **BOT INTELLIGENCE**\n"
-                               f"━━━━━━━━━━━━━━━━━━\n"
-                               f"💾 **Stored Draws:** {count}\n"
-                               f"🎓 **Rank:** {level}\n"
-                               f"🔄 **Backup:** Instant & Active")
+                        nums, conf, count, level = brain.predict(save_to_db=False)
+                        msg = (f"🔮 **MANUAL PREDICTION**\n"
+                               f"🔢 `{nums}`\n"
+                               f"📊 Confidence: {conf}\n"
+                               f"🧠 Logic: {level}")
                         send_telegram(msg)
+                    
+                    # INTELLIGENCE
+                    elif text in ["/intelligence", "/i"]:
+                        count, level, _ = brain.get_intelligence_stats()
+                        send_telegram(f"🧠 **BOT INTELLIGENCE**\n"
+                                      f"💾 Stored Draws: {count}\n"
+                                      f"🎓 Rank: {level}\n"
+                                      f"🤖 Learning Status: Active")
+
+                    # STORES
+                    elif text in ["/stores", "/sr"]:
+                        count, _, _ = brain.get_intelligence_stats()
+                        send_telegram(f"💾 **DATA STORE**\nTotal Draws Saved: {count}")
                         
+                    # HISTORY
                     elif text in ["/history", "/h"]:
                         df = get_history_data(5)
                         if df.empty:
-                            send_telegram("📭 Database is empty. Wait for draws.")
+                            send_telegram("📭 No history found yet.")
                         else:
-                            msg = "📜 **REAL HISTORY (Last 5)**\n━━━━━━━━━━━━━━━━━━\n"
+                            msg = "📜 **LAST 5 DRAW RESULTS**\n━━━━━━━━━━━━━━━━━━\n"
                             for _, row in df.iterrows():
-                                # Format: ID: [1,2,3...]
-                                msg += f"🆔 `{row['draw_id']}`\n🎲 {row['numbers']}\n\n"
+                                try:
+                                    dt = datetime.fromtimestamp(row['timestamp'])
+                                    ts = dt.strftime('%H:%M:%S')
+                                except: ts = "--:--"
+                                msg += f"🆔 `{row['draw_id']}` ({ts})\n🎲 {row['numbers']}\n\n"
                             send_telegram(msg)
-                            
+
+                    # SCREENSHOT
                     elif text in ["/screenshot", "/ss"]:
                         if bot_state["driver"]:
-                            send_telegram("📸 Capturing game view...")
-                            send_screenshot_to_telegram(bot_state["driver"], "Current View")
+                            send_telegram("📸 Capturing screen...")
+                            send_screenshot_to_telegram(bot_state["driver"], "Current Game View")
                         else:
-                            send_telegram("⚠️ Browser not ready.")
-
-                    elif text == "/help":
-                        msg = (f"🕹 **COMMAND LIST**\n"
-                               f"━━━━━━━━━━━━━━━━━━\n"
-                               f"/start - Auto-Predict ON\n"
-                               f"/stop - Auto-Predict OFF\n"
-                               f"/predict - Get one prediction\n"
-                               f"/intelligence - View AI Stats\n"
-                               f"/history - View last 5 draws\n"
-                               f"/screenshot - See game screen")
-                        send_telegram(msg)
-                        
+                            send_telegram("⚠️ Browser initializing...")
+                            
                     elif text == "/force_backup":
                         backup_database()
                         send_telegram("✅ Backup Forced.")
+                        
+                    elif text == "/help":
+                        msg = (f"🕹 **COMMAND LIST**\n"
+                               f"━━━━━━━━━━━━━━━━━━\n"
+                               f"/status, /stat - System Health\n"
+                               f"/accuracy, /a - Honest Win Rate\n"
+                               f"/start, /s - Auto-Predict ON\n"
+                               f"/stop, /st - Auto-Predict OFF\n"
+                               f"/predict, /p - Manual Guess\n"
+                               f"/history, /h - Last 5 Results\n"
+                               f"/intelligence, /i - AI Stats\n"
+                               f"/stores, /sr - Data Count\n"
+                               f"/screenshot, /ss - View Screen")
+                        send_telegram(msg)
 
             time.sleep(1)
         except: time.sleep(5)
 
-# --- 7. BROWSER & SCRAPING ---
+# --- 7. BROWSER ---
 def setup_chrome():
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1280,1024") # Bigger size for better visibility
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--window-size=1080,1920") 
+    options.add_argument("--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+    
     if os.path.exists("/usr/bin/google-chrome"):
         options.binary_location = "/usr/bin/google-chrome"
+    
     driver = webdriver.Chrome(options=options)
     stealth(driver, languages=["en-US"], vendor="Google Inc.", platform="Win32")
     return driver
 
 def scrape_loop(driver):
-    """
-    Looks for the RESULTS tab, scrapes numbers, saves to DB.
-    Returns True if NEW data was found.
-    """
     new_data = False
     try:
-        # Click RESULTS tab if visible
+        # Click RESULTS tab
         try:
             tabs = driver.find_elements(By.XPATH, "//*[contains(text(), 'RESULTS')]")
             for t in tabs: 
@@ -319,49 +378,50 @@ def scrape_loop(driver):
         
         time.sleep(1)
         
-        # Scrape text
+        # Scrape
         text = driver.find_element(By.TAG_NAME, "body").text
         lines = text.split('\n')
-        
         current_id = None
         current_nums = []
         
-        # Regex to find 9-digit Draw ID
         for line in lines:
             line = line.strip()
-            
-            # Match ID (e.g. 864697233)
             id_match = re.search(r'\b(\d{9})\b', line)
-            
             if id_match:
-                # If we were building a previous ID, save it now
                 if current_id and len(current_nums) >= 20:
                     if save_draw_data(current_id, current_nums[:20]):
                         new_data = True
-                
-                # Start new block
                 current_id = id_match.group(1)
                 current_nums = []
                 continue
             
-            # If we are inside a block, find numbers
             if current_id:
-                # Find numbers 1-80
                 nums = re.findall(r'\b([1-9]|[1-7][0-9]|80)\b', line)
                 for n in nums:
                     if int(n) not in current_nums:
                         current_nums.append(int(n))
-                
-                # If we have 20, save immediately
                 if len(current_nums) >= 20:
                     if save_draw_data(current_id, current_nums[:20]):
                         new_data = True
-                    current_id = None # Reset
+                    current_id = None
                     
     except Exception as e:
         print(f"Scrape Error: {e}", flush=True)
         
     return new_data
+
+def ensure_pending_prediction():
+    """Checks if we have a pending prediction. If not, creates one."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT count(*) FROM predictions WHERE draw_id IS NULL")
+        pending_count = c.fetchone()[0]
+        conn.close()
+        
+        if pending_count == 0:
+            brain.predict(save_to_db=True)
+    except: pass
 
 def run_bot():
     init_db()
@@ -373,44 +433,58 @@ def run_bot():
             driver = setup_chrome()
             bot_state["driver"] = driver
             
+            # --- LOGIN SEQUENCE ---
+            print("🔗 Base URL...", flush=True)
             driver.get(BASE_URL)
             time.sleep(3)
-            driver.add_cookie({"name": "token", "value": SESSION_TOKEN, "domain": "flashsport.bet"})
-            driver.get(GAME_URL)
-            time.sleep(15) # Allow full load
             
-            send_telegram("🤖 **Keno Bot v5 Online**\nConnected to FlashSport.")
+            print("🍪 Injecting Cookie...", flush=True)
+            driver.add_cookie({"name": "token", "value": SESSION_TOKEN, "domain": "flashsport.bet"})
+            
+            print("🎮 Game URL...", flush=True)
+            driver.get(GAME_URL)
+            time.sleep(15) 
+            
+            print("✅ Ready. Monitoring...", flush=True)
+            send_telegram("🤖 **Keno Bot v6 Online**\nSyncing with game cycle...")
+            
+            # Initial Prediction on Startup (So user can bet immediately)
+            ensure_pending_prediction()
             
             while True:
-                # 1. Scrape
+                # 1. Scrape for New Results
+                # This function returns True ONLY when a new draw (20 numbers) is fully complete and saved.
                 found_new = scrape_loop(driver)
                 
-                # 2. React
+                # 2. If New Result Found -> PREDICT IMMEDIATELY for the Next Round
                 if found_new:
-                    # New data found! AI is smarter now.
+                    # The previous prediction was just graded inside scrape_loop (save_draw_data).
+                    # Now we must generate the prediction for the UPCOMING draw.
+                    nums, conf, count, level = brain.predict(save_to_db=True)
+                    
+                    # If Auto-Predict is ON, send it to Telegram instantly
                     if bot_state["auto_predict"]:
-                        nums, conf, count, level = brain.predict()
-                        # Only send if we have legitimate data
-                        if count > 5:
-                            msg = (f"⚡ **AUTO-PREDICTION**\n"
-                                   f"🔢 `{nums}`\n"
-                                   f"📊 {conf}")
-                            send_telegram(msg)
+                        msg = (f"⚡ **AUTO**\n🔢 `{nums}`\n📊 {conf}")
+                        send_telegram(msg)
                 
-                # 3. Check Health
+                # 3. Startup Check
+                # Just in case DB is empty or logic missed, ensure there is always a pending prediction for accuracy tracking.
+                ensure_pending_prediction()
+
+                # 4. Check Health
                 if "SESSION EXPIRED" in driver.page_source:
-                    send_telegram("⚠️ Session Expired. Restarting browser...")
+                    send_telegram("⚠️ Session Expired. Restarting...")
                     break
                     
-                time.sleep(5) # Scan every 5 seconds
+                time.sleep(5) 
                 
         except Exception as e:
             print(f"Crash: {e}", flush=True)
         finally:
             if driver: driver.quit()
-            time.sleep(5)
+            time.sleep(10)
 
-# --- 8. WEB SERVER (Keep Alive) ---
+# --- 8. SERVER ---
 class H(BaseHTTPRequestHandler):
     def do_GET(self): self.send_response(200); self.wfile.write(b"OK")
     def do_HEAD(self): self.send_response(200)
