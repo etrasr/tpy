@@ -1,0 +1,7 @@
+selenium
+selenium-stealth
+requests
+pandas
+numpy
+scikit-learn
+webdriver-manager
