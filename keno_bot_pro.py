@@ -63,23 +63,23 @@ def backup_database():
         data = {'message': f'Keno DB Backup {datetime.now()}', 'content': content, 'branch': 'main'}
         if sha: data['sha'] = sha
         requests.put(url, headers=headers, json=data)
-        print("✅ Backup to GitHub success")
-    except Exception as e: print(f"❌ Backup failed: {e}")
+        print("✅ Backup to GitHub success", flush=True)
+    except Exception as e: print(f"❌ Backup failed: {e}", flush=True)
     finally: bot_state["backup_in_progress"] = False
 
 def restore_database():
     try:
-        print("🔄 Restoring DB...")
+        print("🔄 Restoring DB...", flush=True)
         headers = {'Authorization': f'token {GITHUB_ACCESS_TOKEN}', 'Accept': 'application/vnd.github.v3+json'}
         url = f'https://api.github.com/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/contents/{GITHUB_BACKUP_PATH}'
         resp = requests.get(url, headers=headers)
         if resp.status_code == 200:
             with open(DB_PATH, 'wb') as f:
                 f.write(base64.b64decode(resp.json()['content']))
-            print("✅ DB Restored")
+            print("✅ DB Restored", flush=True)
             return True
-        else: print("⚠️ No backup found"); return False
-    except Exception as e: print(f"❌ Restore Error: {e}"); return False
+        else: print("⚠️ No backup found", flush=True); return False
+    except Exception as e: print(f"❌ Restore Error: {e}", flush=True); return False
 
 # --- 4. DATABASE ENGINE ---
 def init_db():
@@ -100,7 +100,6 @@ def save_draw_data(draw_id, numbers):
         c.execute("INSERT INTO history VALUES (?, ?, ?)", (draw_id, nums_str, time.time()))
         conn.commit()
         saved = True
-        # Check if we predicted this
         c.execute("SELECT predicted FROM predictions WHERE draw_id IS NULL ORDER BY timestamp DESC LIMIT 1")
         row = c.fetchone()
         if row:
@@ -141,13 +140,10 @@ class KenoBrain:
     def train(self):
         df = get_data_frame(limit=500)
         bot_state["data_count"] = len(df)
-        
         if len(df) < 5: return
-        
         all_nums = []
         for n_str in df['numbers']:
             all_nums.extend([int(x) for x in n_str.split(',')])
-        
         counts = pd.Series(all_nums).value_counts()
         self.hot_numbers = counts.head(15).index.tolist()
         self.cold_numbers = counts.tail(15).index.tolist()
@@ -155,21 +151,11 @@ class KenoBrain:
 
     def predict(self):
         if not bot_state["model_ready"]: self.train()
-        
         count = bot_state["data_count"]
-        
-        # Calculate Confidence
-        if count < 20:
-            confidence = "Low 🔴 (Collecting Data)"
-            level = "Weak"
-        elif count < 100:
-            confidence = "Medium 🟡 (Learning Patterns)"
-            level = "Moderate"
-        else:
-            confidence = "High 🟢 (Pattern Locked)"
-            level = "Strong"
+        if count < 20: confidence = "Low 🔴 (Collecting Data)"
+        elif count < 100: confidence = "Medium 🟡 (Learning)"
+        else: confidence = "High 🟢 (Locked)"
 
-        # Generate Numbers
         prediction = []
         if len(self.hot_numbers) >= 2: prediction.extend(random.sample(self.hot_numbers[:8], 2))
         if len(self.cold_numbers) >= 1: prediction.extend(random.sample(self.cold_numbers[:8], 1))
@@ -178,15 +164,12 @@ class KenoBrain:
             if x not in prediction: prediction.append(x)
         
         pred_sorted = sorted(prediction)
-        
-        # Save intent
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("INSERT INTO predictions (draw_id, predicted, actual, hit_count, timestamp) VALUES (?, ?, ?, ?, ?)", 
                   (None, ",".join(map(str, pred_sorted)), None, 0, time.time()))
         conn.commit()
         conn.close()
-        
         return pred_sorted, confidence, count
 
 brain = KenoBrain()
@@ -197,8 +180,16 @@ def send_telegram(text):
     try: requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", data={'chat_id': CHAT_ID, 'text': text})
     except: pass
 
+def send_photo(path, caption):
+    if not TELEGRAM_TOKEN or not CHAT_ID: return
+    try:
+        with open(path, 'rb') as f:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data={'chat_id': CHAT_ID, 'caption': caption}, files={'photo': f})
+    except Exception as e: print(f"Photo Fail: {e}")
+
 def telegram_listener():
     offset = 0
+    print("🎧 Telegram Listener Started...", flush=True)
     while True:
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={offset+1}&timeout=30"
@@ -209,41 +200,87 @@ def telegram_listener():
                     if "message" not in u: continue
                     text = u["message"].get("text", "").lower().strip()
                     
+                    # 1. Start/Stop
                     if text == "/start":
                         bot_state["auto_predict"] = True
-                        send_telegram("🟢 **Auto-Predict ON**\nI will analyze every draw and send predictions.")
+                        send_telegram("🟢 **Auto-Predict ON**\nMonitoring for new draws...")
                         
                     elif text == "/stop":
                         bot_state["auto_predict"] = False
                         send_telegram("🔴 **Auto-Predict OFF**")
                         
+                    # 2. Prediction
                     elif text in ["/predict", "/p"]:
                         nums, conf, count = brain.predict()
-                        msg = (f"🔮 **PREDICTION**\n"
-                               f"🔢 Numbers: `{nums}`\n"
-                               f"📊 Confidence: {conf}\n"
-                               f"📚 Data Source: {count} previous draws")
-                        send_telegram(msg)
-                        
-                    elif text in ["/stores", "/intelligence", "/i"]:
+                        send_telegram(f"🔮 **MANUAL PREDICTION**\n🔢 `{nums}`\n📊 {conf}\n📚 Based on {count} draws")
+                    
+                    # 3. Status
+                    elif text in ["/status", "/s"]:
+                        uptime_sec = int(time.time() - bot_state["start_timestamp"])
+                        uptime = str(timedelta(seconds=uptime_sec))
+                        auto_status = "🟢 ON" if bot_state["auto_predict"] else "🔴 OFF"
                         total, avg = get_stats()
                         
-                        # Interpret intelligence
-                        iq_level = "Baby Bot 👶"
-                        if total > 50: iq_level = "Student 🧑‍🎓"
-                        if total > 200: iq_level = "Professor 👨‍🏫"
-                        if total > 1000: iq_level = "Oracle 🔮"
-                        
-                        msg = (f"🧠 **BOT INTELLIGENCE REPORT**\n\n"
-                               f"💾 **Stored Draws:** {total}\n"
-                               f"🎓 **IQ Level:** {iq_level}\n"
-                               f"🎯 **Avg Accuracy:** {avg:.2f} hits/draw\n"
-                               f"🔄 **Backup System:** Active")
+                        msg = (f"📊 **SYSTEM STATUS**\n"
+                               f"🤖 Auto-Predict: {auto_status}\n"
+                               f"⏱️ Uptime: {uptime}\n"
+                               f"💾 Draws Stored: {total}\n"
+                               f"🎯 Avg Accuracy: {avg:.2f} hits\n"
+                               f"🔄 Backup System: Active")
                         send_telegram(msg)
                         
+                    # 4. History
+                    elif text in ["/history", "/h"]:
+                        df = get_data_frame(limit=5)
+                        if df.empty:
+                            send_telegram("📭 No history found yet.")
+                        else:
+                            msg = "📜 **LAST 5 DRAWS**\n"
+                            for index, row in df.iterrows():
+                                ts = datetime.fromtimestamp(row['timestamp']).strftime('%H:%M')
+                                msg += f"🆔 `{row['draw_id']}` ({ts})\n🔢 {row['numbers']}\n\n"
+                            send_telegram(msg)
+                            
+                    # 5. Accuracy Report
+                    elif text in ["/accuracy", "/a"]:
+                        total, avg = get_stats()
+                        msg = (f"🎯 **ACCURACY REPORT**\n"
+                               f"📈 Average Hits: {avg:.2f} / 4\n"
+                               f"📚 Data Points: {total} draws analyzed")
+                        send_telegram(msg)
+                        
+                    # 6. Intelligence (Legacy)
+                    elif text in ["/stores", "/intelligence", "/i"]:
+                        total, avg = get_stats()
+                        iq_level = "Baby 👶"
+                        if total > 50: iq_level = "Student 🧑‍🎓"
+                        if total > 200: iq_level = "Oracle 🔮"
+                        send_telegram(f"🧠 **BRAIN POWER**\n💾 Stored: {total}\n🎓 IQ: {iq_level}\n🎯 Accuracy: {avg:.2f}")
+
+                    # 7. Utilities
+                    elif text in ["/screenshot", "/ss"]:
+                        if bot_state["driver"]:
+                            path = "/tmp/screenshot.png"
+                            bot_state["driver"].save_screenshot(path)
+                            send_photo(path, "📸 Live Vision")
+                        else:
+                            send_telegram("⚠️ Browser loading...")
+                            
                     elif text == "/force_backup":
                         backup_database()
-                        send_telegram("✅ Database forcefully uploaded to GitHub.")
+                        send_telegram("✅ Database forced to GitHub.")
+                        
+                    elif text == "/help":
+                        msg = (f"🕹 **COMMAND LIST**\n\n"
+                               f"/start - Auto-Predict ON\n"
+                               f"/stop - Auto-Predict OFF\n"
+                               f"/predict - Get next numbers\n"
+                               f"/status - System Health\n"
+                               f"/history - Last 5 Draws\n"
+                               f"/accuracy - Win Rate\n"
+                               f"/screenshot - See Screen\n"
+                               f"/force_backup - Save Data")
+                        send_telegram(msg)
 
             time.sleep(1)
         except: time.sleep(5)
@@ -254,9 +291,14 @@ def setup_chrome():
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=400,800")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--window-size=1080,1920")
+    options.add_argument("--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
+    
     if os.path.exists("/usr/bin/google-chrome"):
         options.binary_location = "/usr/bin/google-chrome"
+    
     driver = webdriver.Chrome(options=options)
     stealth(driver, languages=["en-US"], vendor="Google Inc.", platform="Win32")
     return driver
@@ -264,15 +306,12 @@ def setup_chrome():
 def scrape_results(driver):
     new_data = False
     try:
-        # Try clicking Results
         try:
             tabs = driver.find_elements(By.XPATH, "//*[contains(text(), 'RESULTS')]")
             for t in tabs: 
                 if t.is_displayed(): t.click(); break
         except: pass
-        time.sleep(2)
         
-        # Regex Scrape
         text = driver.find_element(By.TAG_NAME, "body").text
         lines = text.split('\n')
         curr_id, nums = None, []
@@ -284,7 +323,7 @@ def scrape_results(driver):
                 if curr_id and len(nums) == 20:
                     if save_draw_data(curr_id, nums):
                         new_data = True
-                        print(f"Imported {curr_id}")
+                        print(f"Imported {curr_id}", flush=True)
                 curr_id = id_match.group(1)
                 nums = []
                 continue
@@ -296,15 +335,13 @@ def scrape_results(driver):
                     nums = nums[:20]
                     if save_draw_data(curr_id, nums):
                         new_data = True
-                        print(f"Imported {curr_id}")
+                        print(f"Imported {curr_id}", flush=True)
                     curr_id = None
-    except Exception as e: print(f"Scrape: {e}")
+    except Exception as e: print(f"Scrape Error: {e}", flush=True)
     return new_data
 
 def run_bot():
     init_db()
-    
-    # Auto Backup Loop
     def sched():
         while True: time.sleep(600); backup_database()
     threading.Thread(target=sched, daemon=True).start()
@@ -312,35 +349,42 @@ def run_bot():
     while True:
         driver = None
         try:
-            print("🚀 Launching Chrome...")
+            print("🚀 Launching Chrome...", flush=True)
             driver = setup_chrome()
+            bot_state["driver"] = driver
+            
+            print("🔗 Base URL...", flush=True)
             driver.get(BASE_URL)
-            time.sleep(2)
+            time.sleep(3)
             driver.add_cookie({"name": "token", "value": SESSION_TOKEN, "domain": "flashsport.bet"})
+            
+            print("🎮 Game URL...", flush=True)
             driver.get(GAME_URL)
-            time.sleep(10)
-            send_telegram("🤖 Keno Bot Connected & Learning...")
+            time.sleep(15) 
+            
+            print("✅ Ready.", flush=True)
+            send_telegram("🤖 Keno Bot v4 Online. Use /help for commands.")
             
             while True:
                 if scrape_results(driver):
                     brain.train()
                     if bot_state["auto_predict"]:
                         nums, conf, count = brain.predict()
-                        msg = (f"⚡ **AUTO-PREDICTION**\n"
-                               f"🔢 `{nums}`\n"
-                               f"📊 Conf: {conf}")
-                        send_telegram(msg)
+                        send_telegram(f"⚡ **AUTO**\n🔢 `{nums}`")
                 
-                if "SESSION EXPIRED" in driver.page_source: break
+                if "SESSION EXPIRED" in driver.page_source:
+                    print("⚠️ Session Expired", flush=True)
+                    break
                 time.sleep(10)
-        except Exception as e: print(f"Err: {e}")
+        except Exception as e: print(f"Error: {e}", flush=True)
         finally: 
             if driver: driver.quit()
-            time.sleep(5)
+            time.sleep(10)
 
 # --- 8. SERVER ---
 class H(BaseHTTPRequestHandler):
     def do_GET(self): self.send_response(200); self.wfile.write(b"OK")
+    def do_HEAD(self): self.send_response(200)
 def srv(): HTTPServer(('0.0.0.0', 10000), H).serve_forever()
 
 if __name__ == "__main__":
