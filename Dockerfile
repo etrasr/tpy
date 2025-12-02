@@ -1,16 +1,24 @@
 # Use Python 3.9 slim image
 FROM python:3.9-slim
 
-# Install system dependencies and Google Chrome
+# Set environment variables to keep Python from writing pyc files
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# 1. Update apt and install basic utilities
 RUN apt-get update && apt-get install -y \
     wget \
-    gnupg2 \
+    curl \
     unzip \
-    && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list' \
-    && apt-get update \
-    && apt-get install -y google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
+    gnupg \
+    --no-install-recommends
+
+# 2. Download and Install Google Chrome Stable directly
+# This avoids the "apt-key" error completely
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
+    apt-get install -y ./google-chrome-stable_current_amd64.deb && \
+    rm google-chrome-stable_current_amd64.deb && \
+    rm -rf /var/lib/apt/lists/*
 
 # Set up the app directory
 WORKDIR /app
